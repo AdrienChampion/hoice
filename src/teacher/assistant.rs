@@ -236,9 +236,7 @@ impl Assistant {
 
           self.solver.push(1) ? ;
           clause.declare(& mut self.solver) ? ;
-          self.solver.assert(
-            & ConjWrap::new( clause.lhs_terms() )
-          ) ? ;
+          clause.assert_lhs_terms(& mut self.solver) ? ;
           self.solver.assert( & ArgValEq::new(args, vals) ) ? ;
           let sat = profile! {
             self wrap {
@@ -284,9 +282,7 @@ impl Assistant {
 
           self.solver.push(1) ? ;
           clause.declare(& mut self.solver) ? ;
-          self.solver.assert(
-            & ConjWrap::new( clause.lhs_terms() )
-          ) ? ;
+          clause.assert_lhs_terms(& mut self.solver) ? ;
           self.solver.assert( & ArgValEq::new(args, vals) ) ? ;
           let sat = profile! {
             self wrap {
@@ -317,35 +313,6 @@ impl Assistant {
     Ok(None)
   }
 
-}
-
-/// Wrapper around a conjunction for smt printing.
-struct ConjWrap<'a> {
-  /// Conjunction.
-  terms: & 'a HConSet<Term>,
-}
-impl<'a> ConjWrap<'a> {
-  /// Constructor.
-  pub fn new(terms: & 'a HConSet<Term>) -> Self {
-    ConjWrap { terms }
-  }
-}
-impl<'a> ::rsmt2::print::Expr2Smt<()> for ConjWrap<'a> {
-  fn expr_to_smt2<Writer: Write>(
-    & self, w: & mut Writer, _: ()
-  ) -> SmtRes<()> {
-    if self.terms.is_empty() {
-      write!(w, "true") ?
-    } else {
-      write!(w, "(and") ? ;
-      for term in self.terms {
-        write!(w, " ") ? ;
-        term.write(w, |w, var| var.default_write(w)) ? ;
-      }
-      write!(w, ")") ?
-    }
-    Ok(())
-  }
 }
 
 

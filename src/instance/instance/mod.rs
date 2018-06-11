@@ -145,6 +145,11 @@ impl Instance {
     debug_assert! { self.neg_clauses.contains(& clause) }
     debug_assert! { self.is_finalized }
 
+    let mut clauses = self.clauses.clone() ;
+    for clause in & mut clauses {
+      clause.unfinalize() ;
+    }
+
     Instance {
       preds: self.preds.clone(),
       old_preds: self.old_preds.clone(),
@@ -152,7 +157,7 @@ impl Instance {
       pred_terms: self.pred_terms.clone(),
       sorted_pred_terms: Vec::with_capacity( self.preds.len() ),
 
-      clauses: self.clauses.clone(),
+      clauses,
       pred_to_clauses: self.pred_to_clauses.clone(),
       is_unsat: false,
       pos_clauses: ClsSet::new(),
@@ -461,6 +466,7 @@ impl Instance {
   ///
   /// - optimize sorting of forced preds by dependencies (low priority)
   pub fn finalize(& mut self) -> Res<()> {
+    log! { @verb "finalizing" }
     if self.is_finalized { return Ok(()) }
     self.is_finalized = true ;
 
@@ -475,6 +481,8 @@ impl Instance {
     ) ;
 
     for (idx, clause) in self.clauses.index_iter_mut() {
+      clause.finalize() ;
+
       if clause.rhs().is_none() {
         if clause.lhs_pred_apps_len() == 1 {
           let is_new = self.strict_neg_clauses.insert(idx) ;
@@ -1378,7 +1386,7 @@ impl Instance {
   pub fn clause_cex_to_data(
     & self, data: & mut Data, clause_idx: ClsIdx, cex: BCex
   ) -> Res<()> {
-    let (mut cex, bias) = cex ;
+    let (cex, bias) = cex ;
     let clause = & self[clause_idx] ;
 
     if_log! { @6
@@ -1392,27 +1400,6 @@ impl Instance {
         "     bias: {}", bias ;
         "      cex: {}", s
       }
-    }
-
-    // Factored set of variables when fixing cex for arguments.
-    let mut known_vars = VarSet::new() ;
-
-    macro_rules! fix_cex {
-      ($args:expr) => ({
-        log! { @6 "fixing {}", $args }
-        for arg in $args.iter() {
-          for var in term::vars(arg) {
-            if ! cex[var].is_known() {
-              // Value for `var` is a non-value.
-              let is_new = known_vars.insert(var) ;
-              // Variable appears in more than one arg, force its value.
-              if ! is_new {
-                cex[var] = cex[var].typ().default_val()
-              }
-            }
-          }
-        }
-      })
     }
 
     let (lhs, rhs) = match bias {
@@ -1451,37 +1438,6 @@ impl Instance {
 
     } ;
 
-    // Force non-values in the cex if we're dealing with a constraint, not a
-    // sample.
-    if (
-      // Positive sample?
-      lhs.is_empty() && rhs.is_some()
-    ) || (
-      // Negative sample?
-      lhs.iter().next().map(
-        |(_, argss)| argss.len() == 1
-      ).unwrap_or(false) && rhs.is_none()
-    ) {
-      // We're generating a sample. Still need to force variables that appear
-      // more than once in arguments.
-      for (_, argss) in & lhs {
-        debug_assert_eq! { argss.len(), 1 }
-        for args in argss {
-          fix_cex!(args)
-        }
-      }
-      if let Some((_, args)) = rhs.as_ref() {
-        fix_cex!(args)
-      }
-    } else {
-      // We're dealing with a constraint, not a sample. Force non-values.
-      for val in cex.iter_mut() {
-        if ! val.is_known() {
-          * val = val.typ().default_val()
-        }
-      }
-    }
-
     // Evaluates some arguments for a predicate.
     macro_rules! eval {
       ($args:expr) => ({
@@ -1499,12 +1455,24 @@ impl Instance {
     let mut antecedents = vec![] ;
     for (pred, argss) in lhs {
       for args in argss {
+        let args = if let Some((args, _)) = clause.lhs_unique_args(
+          pred, & args
+        ) {
+          args
+        } else {
+          & args
+        } ;
         let sample = eval!(args) ;
         antecedents.push((pred, sample))
       }
     }
 
     let consequent = if let Some((pred, args)) = rhs {
+      let args = if let Some((args, _)) = clause.rhs_unique_args() {
+        args
+      } else {
+        & args
+      } ;
       let sample = eval!(args) ;
       Some( (pred, sample) )
     } else {

@@ -208,6 +208,9 @@ pub trait SubsumeExt {
   ///
   /// Same as `set_subsumed_rm`, but does remove anything.
   fn set_subsumed(& self, set: & Self::Set) -> bool ;
+
+  /// Checks whether `self` is complimentary with anything in the set.
+  fn set_complementary(& self, set: & Self::Set) -> bool ;
 }
 impl SubsumeExt for VarVals {
   type Set = VarValsSet ;
@@ -259,6 +262,19 @@ impl SubsumeExt for VarVals {
     } else {
       for elem in set.iter() {
         if elem.subsumes(self) {
+          return true
+        }
+      }
+      false
+    }
+  }
+
+  fn set_complementary(& self, set: & Self::Set) -> bool {
+    if ! conf.teacher.partial {
+      set.contains(self)
+    } else {
+      for elem in set.iter() {
+        if elem.is_complementary(self) {
           return true
         }
       }

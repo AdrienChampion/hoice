@@ -1,7 +1,7 @@
 //! Contains the clause structure for encapsulation.
 
 use common::* ;
-use var_to::terms::VarTermsSet ;
+use var_to::terms::{ VarTermsSet, VarTermsMap } ;
 use instance::info::VarInfo ;
 
 /// Creates a clause.
@@ -18,6 +18,7 @@ pub fn new(
     vars, lhs_terms, lhs_preds, rhs,
     terms_changed: true, preds_changed: true,
     from_unrolling: false, info, from,
+    preds_unique: (PrdHMap::new(), None),
   } ;
   for tterm in lhs { clause.lhs_insert(tterm) ; }
   clause
@@ -57,6 +58,17 @@ pub struct Clause {
 
   /// Index of the original clause this comes from.
   from: ClsIdx,
+
+  /// Map from predicate applications to alternate applications.
+  ///
+  /// This is used to enforce all arguments are a distinct variable without
+  /// touching the original clause.
+  ///
+  /// Populated by `finalize`.
+  preds_unique: (
+    PrdHMap<VarTermsMap<(VarTerms, Vec<(VarIdx, Term)>)>>,
+    Option< (VarTerms, Vec<(VarIdx, Term)>)  >
+  ),
 }
 
 
@@ -259,6 +271,9 @@ impl Clause {
       from_unrolling: self.from_unrolling,
       info,
       from: self.from.clone(),
+      preds_unique: (
+        PrdHMap::new(), None
+      ),
     }
   }
 
@@ -300,7 +315,10 @@ impl Clause {
       terms_changed, preds_changed,
       from_unrolling: self.from_unrolling,
       info,
-      from: self.from.clone()
+      from: self.from.clone(),
+      preds_unique: (
+        PrdHMap::new(), None
+      ),
     }
   }
 
@@ -642,6 +660,102 @@ impl Clause {
   /// (preds_checked method)
   pub fn preds_changed(& self) -> bool { self.preds_changed }
 
+
+  /// Unfinalizes the clause.
+  ///
+  /// Empties the fresh variables introduced for pred apps' arguments.
+  pub fn unfinalize(& mut self) {
+    self.preds_unique.0.clear() ;
+    self.preds_unique.1 = None
+  }
+
+
+  /// Finalizes the clause.
+  ///
+  /// Introduces new variables (if needed) for predicate applications'
+  /// arguments.
+  pub fn finalize(& mut self) {
+    let mut known = VarSet::new() ;
+
+    let mut nu_terms = vec![] ;
+    let mut nu_argss = VarTermsMap::new() ;
+    let mut nu_args = vec![] ;
+
+    let var_infos = & mut self.vars ;
+    let lhs_preds_unique = & mut self.preds_unique.0 ;
+    let rhs_preds_unique = & mut self.preds_unique.1 ;
+
+    /// Fixes some arguments. Assumes `nu_args.is_empty()`.
+    ///
+    /// Introduces new variables (and relevant terms) if needed. If it did
+    /// anything, yields the new arguments.
+    ///
+    /// Otherwise it returns `None`.
+    macro_rules! fix_args {
+      ($args:expr) => ({
+        debug_assert! { nu_args.is_empty() }
+        let mut fix = false ;
+
+        for arg in $args.get() {
+          if let Some(idx) = arg.var_idx() {
+            let is_new = known.insert(idx) ;
+            if is_new {
+              nu_args.push( arg.clone() ) ;
+              continue
+            }
+          }
+          // Argument's not an unseen var.
+          fix = true ;
+          let var_idx = var_infos.next_index() ;
+          var_infos.push(
+            VarInfo::new( var_idx.default_str(), arg.typ(), var_idx )
+          ) ;
+          nu_terms.push(
+            ( var_idx, arg.clone() )
+          ) ;
+          nu_args.push(
+            term::var( var_idx, arg.typ() )
+          )
+        }
+
+        if fix {
+          Some(
+            (
+              var_to::terms::new(
+                nu_args.drain( 0 .. ).collect()
+              ),
+              nu_terms.drain( 0 .. ).collect()
+            )
+          )
+        } else {
+          nu_args.clear() ;
+          None
+        }
+      })
+    }
+
+    for (pred, argss) in & self.lhs_preds {
+      debug_assert! { nu_argss.is_empty() }
+      for args in argss {
+        if let Some((nu_args, nu_terms)) = fix_args!(args) {
+          nu_argss.insert(args.clone(), (nu_args, nu_terms)) ;
+        }
+      }
+
+      if ! nu_argss.is_empty() {
+        lhs_preds_unique.insert(
+          * pred, nu_argss.drain().collect()
+        ) ;
+      }
+    }
+
+    if let Some((_, args)) = self.rhs.as_ref() {
+      if let Some((nu_args, nu_terms)) = fix_args!(args) {
+        * rhs_preds_unique = Some((nu_args, nu_terms))
+      }
+    }
+  }
+
   /// Checks a clause is well-formed.
   #[cfg(debug_assertions)]
   pub fn check(& self, blah: & 'static str) -> Res<()> {
@@ -703,7 +817,10 @@ impl Clause {
   /// True if the clause's LHS is empty.
   #[inline]
   pub fn lhs_is_empty(& self) -> bool {
-    self.lhs_terms.is_empty() && self.lhs_preds.is_empty()
+    self.lhs_terms.is_empty()
+    && self.lhs_preds.is_empty()
+    && self.preds_unique.0.is_empty()
+    && self.preds_unique.1.is_none()
   }
 
   /// LHS accessor (terms).
@@ -773,6 +890,46 @@ impl Clause {
       }
     }
     Ok(())
+  }
+
+  /// Assert all rhs terms.
+  pub fn assert_lhs_terms<Parser>(
+    & self, solver: & mut Solver<Parser>
+  ) -> Res<()> {
+    if ! self.lhs_is_empty() {
+      solver.assert(
+        & LhsTerms {
+          lhs_terms: & self.lhs_terms, preds_unique: & self.preds_unique
+        }
+      ) ?
+    }
+    Ok(())
+  }
+
+  /// Returns the real arguments of a lhs predicate application.
+  ///
+  /// Only available after finalize. After finalization, some new variables and
+  /// terms are potentially introduced to ensure the predicate applications'
+  /// arguments are unique. This is stored separately, and this function gives
+  /// access to both.
+  pub fn lhs_unique_args<'a>(
+    & self, pred: PrdIdx, args: & VarTerms
+  ) -> Option<& (VarTerms, Vec<(VarIdx, Term)>) > {
+    self.preds_unique.0.get(& pred).and_then(
+      |map| map.get(args)
+    )
+  }
+
+  /// Returns the real arguments of a rhs predicate application.
+  ///
+  /// Only available after finalize. After finalization, some new variables and
+  /// terms are potentially introduced to ensure the predicate applications'
+  /// arguments are unique. This is stored separately, and this function gives
+  /// access to both.
+  pub fn rhs_unique_args(& self) -> Option<
+    & (VarTerms, Vec<(VarIdx, Term)>)
+  > {
+    self.preds_unique.1.as_ref()
   }
 
   /// Writes a clause given a special function to write predicates.  
@@ -879,8 +1036,30 @@ impl<'a, 'b> ::rsmt2::print::Expr2Smt<
     }
 
     for term in & self.lhs_terms {
-      writer.write_all( " ".as_bytes() ) ? ;
+      write!(writer, " ") ? ;
       term.write( writer, |w, var| var.default_write(w) ) ?
+    }
+
+    for (_, args_map) in & self.preds_unique.0 {
+      for (_, (_, terms)) in args_map {
+        for (var, term) in terms {
+          write!(writer, " (= ") ? ;
+          var.default_write(writer) ? ;
+          write!(writer, " ") ? ;
+          term.write( writer, |w, var| var.default_write(w) ) ? ;
+          write!(writer, ")") ?
+        }
+      }
+    }
+
+    if let Some((_, terms)) = self.preds_unique.1.as_ref() {
+      for (var, term) in terms {
+        write!(writer, " (= ") ? ;
+        var.default_write(writer) ? ;
+        write!(writer, " ") ? ;
+        term.write( writer, |w, var| var.default_write(w) ) ? ;
+        write!(writer, ")") ?
+      }
     }
 
     for (pred, argss) in & self.lhs_preds {
@@ -892,6 +1071,13 @@ impl<'a, 'b> ::rsmt2::print::Expr2Smt<
         for args in argss {
           writer.write_all( " (".as_bytes() ) ? ;
           writer.write_all( prd_info[* pred].name.as_bytes() ) ? ;
+          let args = if let Some((args, _)) = self.lhs_unique_args(
+            * pred, args
+          ) {
+            args
+          } else {
+            args
+          } ;
           for arg in args.iter() {
             writer.write_all( " ".as_bytes() ) ? ;
             arg.write(writer, |w, var| var.default_write(w)) ?
@@ -912,6 +1098,11 @@ impl<'a, 'b> ::rsmt2::print::Expr2Smt<
         write!(writer, "false") ?
       } else {
         write!(writer, "({}", prd_info[prd].name) ? ;
+        let args = if let Some((args, _)) = self.rhs_unique_args() {
+          args
+        } else {
+          args
+        } ;
         for arg in args.iter() {
           write!(writer, " ") ? ;
           arg.write(writer, |w, var| var.default_write(w)) ?
@@ -933,3 +1124,54 @@ impl<'a, 'b> ::rsmt2::print::Expr2Smt<
     Ok(())
   }
 }
+
+
+
+
+/// Assumes there's at least one term in its fields.
+struct LhsTerms<'a> {
+  lhs_terms: & 'a HConSet<Term>,
+  preds_unique: & 'a (
+    PrdHMap<VarTermsMap<(VarTerms, Vec<(VarIdx, Term)>)>>,
+    Option< (VarTerms, Vec<(VarIdx, Term)>)  >
+  ),
+}
+impl<'a> ::rsmt2::print::Expr2Smt<()> for LhsTerms<'a> {
+  fn expr_to_smt2<Writer: Write>(
+    & self, w: & mut Writer, _: ()
+  ) -> SmtRes<()> {
+    write!(w, "(and") ? ;
+
+    for term in self.lhs_terms {
+      write!(w, " ") ? ;
+      term.write( w, |w, var| var.default_write(w) ) ?
+    }
+
+    for (_, args_map) in & self.preds_unique.0 {
+      for (_, (_, terms)) in args_map {
+        for (var, term) in terms {
+          write!(w, " (= ") ? ;
+          var.default_write(w) ? ;
+          write!(w, " ") ? ;
+          term.write( w, |w, var| var.default_write(w) ) ? ;
+          write!(w, ")") ?
+        }
+      }
+    }
+
+    if let Some((_, terms)) = self.preds_unique.1.as_ref() {
+      for (var, term) in terms {
+        write!(w, " (= ") ? ;
+        var.default_write(w) ? ;
+        write!(w, " ") ? ;
+        term.write( w, |w, var| var.default_write(w) ) ? ;
+        write!(w, ")") ?
+      }
+    }
+
+    write!(w, ")") ? ;
+    Ok(())
+  }
+}
+
+

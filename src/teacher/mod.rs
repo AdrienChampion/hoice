@@ -981,6 +981,14 @@ impl<'a> Teacher<'a> {
       debug_assert! { cant_pos_argss.is_empty() }
 
       for args in argss {
+        let args = if let Some((args, _)) = clause.lhs_unique_args(
+          pred, args
+        ) {
+          args
+        } else {
+          args
+        } ;
+
         log! { @6 "generating actlit for {}", args }
         let actlit = self.solver.get_actlit() ? ;
         let disjunction = DisjArgs::new(
@@ -1023,6 +1031,11 @@ impl<'a> Teacher<'a> {
     //
     // So `rhs_actlit.is_none()` => we can't force the rhs to be false.
     let rhs_actlit = if let Some((pred, args)) = clause.rhs() {
+      let args = if let Some((args, _)) = clause.rhs_unique_args() {
+        args
+      } else {
+        args
+      } ;
       log! { @5 "-> {}", self.instance[pred] }
       if self.data.neg[pred].is_empty() {
         // No negative data...

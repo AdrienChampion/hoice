@@ -464,9 +464,33 @@ impl Data {
   }
 
 
+  /// Retrieves all args from `self.map` that are comparable to `args`.
+  fn remove_comparable(
+    & mut self, pred: PrdIdx, args: & VarVals
+  ) -> Option<CstrSet> {
+    profile! { self tick "remove_sub" }
+    if ! conf.teacher.partial {
+      return self.map[pred].remove(args)
+    }
+
+    let mut res = None ;
+    self.map[pred].retain(
+      |s, set| if ! args.compare(s).is_none() {
+        res.get_or_insert_with(
+          || CstrSet::with_capacity(set.len())
+        ).extend( set.drain() ) ;
+        false
+      } else {
+        true
+      }
+    ) ;
+    profile! { self mark "remove_sub" }
+    res
+  }
 
 
   /// Retrieves all args `s` from `self.map` such that `args.subsumes(s)`
+  #[allow(dead_code)]
   fn remove_subs(
     & mut self, pred: PrdIdx, args: & VarVals
   ) -> Option<CstrSet> {
@@ -579,7 +603,7 @@ impl Data {
           }
         }
 
-        if let Some(constraints) = self.remove_subs(pred, & args) {
+        if let Some(constraints) = self.remove_comparable(pred, & args) {
 
           profile! { self tick "propagate", "cstr update" }
           for constraint_idx in constraints {
@@ -810,14 +834,20 @@ impl Data {
 
       // If no partial examples and sample is new, no need to check anything.
       if conf.teacher.partial || ! is_new {
-        if args.set_subsumed(& self.pos[pred]) {
+        if args.set_complementary(& self.pos[pred]) {
           // Positive, skip.
           continue 'lhs_iter
-        } else if args.set_subsumed(& self.neg[pred]) {
+        } else if args.set_complementary(& self.neg[pred]) {
           // Negative, constraint is trivial.
           profile! { self mark "add cstr", "pre-checks" }
           profile! { self "trivial constraints" => add 1 }
           return Ok(false)
+        }
+      }
+
+      profile! {
+        self "cstr partial" => add {
+          if args.is_partial() { 1 } else { 0 }
         }
       }
 
@@ -845,14 +875,20 @@ impl Data {
 
         // If no partial examples and sample is new, no need to check anything.
         if conf.teacher.partial || ! is_new {
-          if args.set_subsumed(& self.pos[pred]) {
+          if args.set_complementary(& self.pos[pred]) {
             profile! { self mark "add cstr", "pre-checks" }
             profile! { self "trivial constraints" => add 1 }
             // Positive, constraint is trivial.
             return Ok(false)
-          } else if args.set_subsumed(& self.neg[pred]) {
+          } else if args.set_complementary(& self.neg[pred]) {
             // Negative, ignore.
             break 'get_rhs None
+          }
+        }
+
+        profile! {
+          self "cstr partial" => add {
+            if args.is_partial() { 1 } else { 0 }
           }
         }
 
